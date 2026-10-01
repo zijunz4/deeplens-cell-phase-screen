@@ -1,0 +1,31 @@
+"""Image simulation: Monte-Carlo ray integration and PSF-based rendering."""
+
+from .detector import DetectorModel
+from .metaoptic import MetaOpticChannelArray
+from .monte_carlo import assign_points_to_pixels, backward_integral, forward_integral
+from .psf import (
+    conv_psf,
+    conv_psf_depth_interp,
+    conv_psf_map,
+    conv_psf_map_depth_interp,
+    conv_psf_occlusion,
+    interp_psf_map,
+    rotate_psf,
+    splat_psf_per_pixel,
+)
+
+__all__ = [
+    "forward_integral",
+    "assign_points_to_pixels",
+    "backward_integral",
+    "DetectorModel",
+    "MetaOpticChannelArray",
+    "conv_psf",
+    "conv_psf_map",
+    "conv_psf_map_depth_interp",
+    "conv_psf_depth_interp",
+    "conv_psf_occlusion",
+    "interp_psf_map",
+    "rotate_psf",
+    "splat_psf_per_pixel",
+]

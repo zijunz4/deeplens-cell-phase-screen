@@ -1,0 +1,26 @@
+# All physical lengths are um. These are synthetic shape classes.
+optics:
+  tile_pixels: 32
+  gap_pixels: 4
+  pixel_um: 0.5
+  wavelength_um: 0.55
+  medium_index: 1.335
+  cell_to_array_um: 20.0
+  array_to_sensor_um: 40.0
+  diameter_um: [10.0, 16.0]
+  thickness_um: [3.0, 6.0]
+  delta_n: [0.02, 0.04]
+  shift_um: 2.0
+  detector_bins: 8
+  phase_levels: 0
+training:
+  seed: 17
+  train_samples: 256
+  validation_samples: 128
+  test_samples: 128
+  epochs: 20
+  batch_size: 32
+  optical_lr: 0.03
+  digital_lr: 0.003
+  contrastive_epochs: 0
+  threads: 4

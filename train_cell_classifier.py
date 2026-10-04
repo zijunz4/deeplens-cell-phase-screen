@@ -118,7 +118,10 @@ def run_experiment(config, settings, output, mode):
     model.load_state_dict(best_state)
     metrics, logits = evaluate(model, test)
     prediction = logits.argmax(1)
-    confusion = torch.bincount(test[1] * 2 + prediction, minlength=4).reshape(2, 2)
+    class_count = int(test[1].max().item()) + 1
+    confusion = torch.bincount(
+        test[1] * class_count + prediction, minlength=class_count**2
+    ).reshape(class_count, class_count)
     with torch.no_grad():
         features, records = model.encoder(test[0][:8], return_records=True)
         energies = {
@@ -147,7 +150,7 @@ def run_experiment(config, settings, output, mode):
         "python": platform.python_version(),
         "torch": torch.__version__,
         "phase_formula": "2*pi*delta_n*thickness_um/wavelength_um",
-        "class_names": ["circle", "rectangle"],
+        "class_names": ["circle", "rectangle", "triangle"],
         "limitations": "Synthetic thin phase slabs; ideal coherent scalar optics; no shot/read noise, polarization or meta-atom response. One seed is not evidence of optical advantage.",
     }
     (output / "report.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
@@ -176,6 +179,7 @@ def run_experiment(config, settings, output, mode):
                 "predicted": int(prediction[i]),
                 "p_circle": float(probabilities[i, 0]),
                 "p_rectangle": float(probabilities[i, 1]),
+                "p_triangle": float(probabilities[i, 2]),
                 **dict(
                     zip(
                         (
@@ -198,8 +202,8 @@ def run_experiment(config, settings, output, mode):
         -config.pixels * config.pixel_um / 2,
         config.pixels * config.pixel_um / 2,
     ] * 2
-    fig, axes = plt.subplots(2, 3, figsize=(11, 7), constrained_layout=True)
-    for row, label in enumerate((0, 1)):
+    fig, axes = plt.subplots(3, 3, figsize=(11, 10), constrained_layout=True)
+    for row, label in enumerate((0, 1, 2)):
         index = (
             int((test[1][:8] == label).nonzero()[0])
             if bool((test[1][:8] == label).any())

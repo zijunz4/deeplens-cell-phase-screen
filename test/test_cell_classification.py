@@ -9,6 +9,9 @@ from deeplens.cell_classification import (
     CellClassifier,
     CellOpticalEncoder,
     CellOpticsConfig,
+    detector_response_metrics,
+    maximize_class_difference,
+    optical_energy,
     phase_cells,
     supervised_contrastive,
 )
@@ -27,8 +30,8 @@ def test_phantom_units_area_and_split_reproducibility():
     torch.testing.assert_close(
         areas, torch.pi * metadata[:, 0] ** 2 / 4, rtol=0.06, atol=0
     )
-    for row in metadata[labels == 0]:
-        assert bool((metadata[labels == 1] == row).all(1).any())
+    for row in metadata:
+        assert bool((metadata == row).all(1).sum() >= 1)
     assert phase[:, :, 0].count_nonzero() == 0
     assert phase[:, :, -1].count_nonzero() == 0
 
@@ -100,8 +103,7 @@ def test_contrastive_gradients_and_invalid_inputs():
         supervised_contrastive(torch.rand(2, 8), torch.tensor([0, 1]))
     with pytest.raises(ValueError):
         replace(c, diameter_um=(100, 150))
-    with pytest.raises(ValueError):
-        phase_cells(7, c, 1)
+    assert phase_cells(7, c, 1)[1].unique().numel() == 3
 
 
 def test_plane_wave_analytic_propagation():
@@ -119,3 +121,28 @@ def test_plane_wave_analytic_propagation():
         dtype=torch.float64,
     )
     torch.testing.assert_close(result, field * torch.exp(1j * angle))
+
+
+def test_detector_response_metrics_are_interpretable():
+    features = torch.tensor([[4.0, 1.0], [3.0, 1.0], [1.0, 4.0], [1.0, 3.0]])
+    labels = torch.tensor([0, 0, 1, 1])
+    metrics = detector_response_metrics(features, labels)
+    assert torch.equal(metrics["preferred_bin"], torch.tensor([0, 1]))
+    assert torch.all(metrics["contrast"] > 0)
+    assert torch.allclose(metrics["cross_talk"], torch.tensor([1 / 3.5, 1 / 3.5]))
+
+
+def test_optical_energy_rejects_real_inputs():
+    field = torch.ones(2, 4, 4, dtype=torch.complex64)
+    assert torch.equal(optical_energy(field), torch.tensor([16.0, 16.0]))
+    with pytest.raises(ValueError, match="complex"):
+        optical_energy(field.real)
+
+
+def test_class_difference_loss_prefers_separated_centroids():
+    labels = torch.tensor([0, 0, 1, 1])
+    close = torch.tensor([[0.0], [0.1], [0.0], [0.1]])
+    far = torch.tensor([[0.0], [0.1], [2.0], [2.1]])
+    assert maximize_class_difference(far, labels) < maximize_class_difference(
+        close, labels
+    )

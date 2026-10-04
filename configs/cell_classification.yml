@@ -2,6 +2,8 @@
 optics:
   tile_pixels: 32
   gap_pixels: 4
+  # High-resolution physical cell plane; use 68 for quick smoke tests.
+  cell_grid_pixels: 5000
   pixel_um: 0.5
   wavelength_um: 0.55
   medium_index: 1.335

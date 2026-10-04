@@ -39,19 +39,28 @@ class CellOpticsConfig:
     shift_um: float = 2.0
     detector_bins: int = 8
     phase_levels: int = 0
+    cell_grid_pixels: int = 68
 
     @property
     def pixels(self):
-        """Side length of the common physical grid."""
-        return 2 * self.tile_pixels + self.gap_pixels
+        """Side length of the common physical grid used by the cell screen."""
+        return self.cell_grid_pixels
 
     def __post_init__(self):
         """Reject unsupported geometry and nonphysical settings."""
-        for name in ("tile_pixels", "gap_pixels", "detector_bins", "phase_levels"):
+        for name in (
+            "tile_pixels",
+            "gap_pixels",
+            "detector_bins",
+            "phase_levels",
+            "cell_grid_pixels",
+        ):
             value = getattr(self, name)
             if not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        if self.tile_pixels < 2 or not 1 <= self.detector_bins <= self.pixels:
+        if self.tile_pixels < 2 or self.cell_grid_pixels < 2:
+            raise ValueError("Invalid tile size or cell grid size")
+        if not 1 <= self.detector_bins <= self.pixels:
             raise ValueError("Invalid tile size or detector bin count")
         if self.phase_levels == 1:
             raise ValueError("phase_levels must be zero (continuous) or >= 2")
@@ -74,7 +83,7 @@ class CellOpticsConfig:
 
 
 def phase_cells(count, config, seed):
-    """Generate balanced, paired circle/rectangle phase phantoms.
+    """Generate circle, rectangle, and triangle phase phantoms.
 
     Args:
         count (int): Even number of samples, at least four.
@@ -82,7 +91,8 @@ def phase_cells(count, config, seed):
         seed (int): Local RNG seed; use distinct seeds for each data split.
 
     Returns:
-        tuple: Phase [B, 1, H, W] in radians, labels [B] (circle=0), and
+        tuple: Phase [B, 1, H, W] in radians, labels [B] (circle=0,
+        rectangle=1, triangle=2), and
         per-sample metadata [B, 7]: diameter, thickness, delta_n, x, y, angle,
         rectangle aspect ratio. Length columns are in um, angle in radians.
 
@@ -91,10 +101,11 @@ def phase_cells(count, config, seed):
     Phase is 2*pi*delta_n*thickness/vacuum_wavelength. The rectangle is a slab,
     and the circular mask is also a constant-thickness slab, not a sphere.
     """
-    if count < 4 or count % 2:
-        raise ValueError("count must be even and at least four")
+    if count < 4:
+        raise ValueError("count must be at least four")
     rng = torch.Generator().manual_seed(seed)
-    r = torch.rand(count // 2, 7, generator=rng)
+    groups = (count + 2) // 3
+    r = torch.rand(groups, 7, generator=rng)
     for col, bounds in enumerate(
         (config.diameter_um, config.thickness_um, config.delta_n)
     ):
@@ -102,8 +113,8 @@ def phase_cells(count, config, seed):
     r[:, 3:5] = (r[:, 3:5] * 2 - 1) * config.shift_um
     r[:, 5] *= 2 * math.pi
     r[:, 6] = 1.0 + 0.5 * r[:, 6]
-    metadata = r.repeat_interleave(2, dim=0)
-    labels = torch.arange(count) % 2
+    metadata = r.repeat_interleave(3, dim=0)[:count]
+    labels = torch.arange(count) % 3
     coord = (torch.arange(config.pixels) - (config.pixels - 1) / 2) * config.pixel_um
     y, x = torch.meshgrid(coord, coord, indexing="ij")
     d, t, dn, cx, cy, angle, aspect = metadata.T[:, :, None, None]
@@ -115,7 +126,19 @@ def phase_cells(count, config, seed):
     rectangle = (xr.abs() <= (area * aspect).sqrt() / 2) & (
         yr.abs() <= (area / aspect).sqrt() / 2
     )
-    support = torch.where(labels[:, None, None] == 0, circle, rectangle)
+    side = (4 * area / math.sqrt(3)).sqrt()
+    height = math.sqrt(3) * side / 2
+    y_bottom = -height / 3
+    triangle = (
+        (yr >= y_bottom)
+        & (yr <= 2 * height / 3)
+        & (xr.abs() <= side / 2 * (1 - (yr - y_bottom) / height))
+    )
+    support = torch.where(
+        labels[:, None, None] == 0,
+        circle,
+        torch.where(labels[:, None, None] == 1, rectangle, triangle),
+    )
     phase = support * (2 * math.pi * dn * t / config.wavelength_um)
     order = torch.randperm(count, generator=rng)
     return phase[order, None], labels[order], metadata[order]
@@ -201,6 +224,53 @@ class CellOpticalEncoder(nn.Module):
         return features
 
 
+def optical_energy(field):
+    """Return integrated optical energy over the sampled simulation window."""
+    if not torch.is_tensor(field) or field.ndim < 2 or not field.is_complex():
+        raise ValueError("field must be a complex tensor with two spatial axes")
+    return field.abs().square().sum(dim=(-2, -1))
+
+
+def detector_response_metrics(features, labels, eps=1e-12):
+    """Compute class response and cross-talk metrics for detector features.
+
+    The detector bins are treated as candidate optical channels. For each class,
+    ``preferred_bin`` is the bin with the largest mean response. ``contrast``
+    compares its class mean against the largest response from the other class,
+    while ``cross_talk`` reports the normalized off-class response. These
+    metrics are descriptive diagnostics and do not alter training.
+    """
+    if features.ndim != 2 or labels.ndim != 1 or features.shape[0] != labels.numel():
+        raise ValueError("features must be [B, channels] and labels must be [B]")
+    classes = torch.unique(labels, sorted=True)
+    if classes.numel() < 2:
+        raise ValueError("at least two classes are required")
+    means = torch.stack([features[labels == cls].mean(0) for cls in classes])
+    preferred = means.argmax(dim=1)
+    own = means[torch.arange(len(classes), device=features.device), preferred]
+    other = (
+        torch.stack(
+            [
+                means[j, preferred[i]]
+                for i in range(len(classes))
+                for j in range(len(classes))
+                if j != i
+            ]
+        )
+        .reshape(len(classes), -1)
+        .max(1)
+        .values
+    )
+    contrast = (own - other) / (own + other + eps)
+    cross_talk = other / (own + eps)
+    return {
+        "class_means": means,
+        "preferred_bin": preferred,
+        "contrast": contrast,
+        "cross_talk": cross_talk,
+    }
+
+
 class CellClassifier(nn.Module):
     """Trainable optical encoder followed by a small digital MLP."""
 
@@ -209,7 +279,7 @@ class CellClassifier(nn.Module):
         super().__init__()
         self.encoder = CellOpticalEncoder(config)
         self.backend = nn.Sequential(
-            nn.Linear(config.detector_bins**2, 32), nn.GELU(), nn.Linear(32, 2)
+            nn.Linear(config.detector_bins**2, 32), nn.GELU(), nn.Linear(32, 3)
         )
 
     def forward(self, phase):
@@ -233,3 +303,29 @@ def supervised_contrastive(features, labels, temperature=0.1):
     logits = (z @ z.T / temperature).masked_fill(diagonal, -torch.inf)
     log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     return -(log_prob.masked_fill(~positive, 0).sum(1) / positive.sum(1)).mean()
+
+
+def maximize_class_difference(features, labels, margin=1.0):
+    """Maximize separation of the mean optical responses between classes.
+
+    This is a simple metric-learning objective for the digital readout: the
+    mean feature vector of each class is pulled away from the other class while
+    samples remain close to their own class centroid. It is useful when the
+    optical encoder is intentionally optimized for class difference instead of
+    image reconstruction.
+    """
+    if features.ndim != 2 or labels.ndim != 1 or len(features) != len(labels):
+        raise ValueError("features must be [B, channels] and labels must be [B]")
+    classes = torch.unique(labels, sorted=True)
+    if classes.numel() < 2:
+        raise ValueError("at least two classes are required")
+    centroids = torch.stack([features[labels == cls].mean(0) for cls in classes])
+    intra = torch.stack(
+        [
+            ((features[labels == cls] - centroids[i]) ** 2).mean()
+            for i, cls in enumerate(classes)
+        ]
+    ).mean()
+    distances = torch.pdist(centroids)
+    inter = distances.min()
+    return intra + F.relu(features.new_tensor(margin) - inter)
